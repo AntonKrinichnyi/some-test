@@ -1,35 +1,31 @@
 #!/usr/bin/env python3
 """
-IPv6 -> IPv4 релей UDP-потока.
+Мост ZeroTier IPv6 -> локальный IPv4 для Mission Planner.
 
-Принимает поток по IPv6 и перекладывает его на IPv4. Нужен там, где приёмник
-не умеет IPv6 -- например Mission Planner в слушающем режиме UDP, который
-биндится на 0.0.0.0 и IPv6-пакетов не видит.
+ZeroTier выдаёт борту адрес вида fd..., а Mission Planner в слушающем режиме
+UDP умеет только IPv4. Скрипт забирает поток с борта по IPv6 и отдаёт его на
+127.0.0.1, где Mission Planner его увидит. Команды и запросы параметров идут
+обратно тем же путём.
 
-Правишь настройки ниже и запускаешь:  python3 stream.py
+Впиши адрес борта ниже и запусти:   python3 stream.py
+В Mission Planner: режим UDP (слушающий), порт = LOCAL_PORT.
 """
 
 # ═══════════════ НАСТРОЙКИ ═══════════════
 
-# Откуда берём поток по IPv6.
-#   "listen"  -- источник сам шлёт нам, мы слушаем порт
-#   "connect" -- источник ждёт подключения, идём к нему сами
-MODE = "listen"
+# IPv6-адрес борта в сети ZeroTier. Без квадратных скобок.
+# Посмотреть можно в консоли ZeroTier или на самом борту: ip -6 addr show dev zt+
+DRONE_IP = "fd80:56c2:e21c:0000:0199:9300:aabb:ccdd"   # <-- сюда адрес борта из ZeroTier
 
-# Для MODE = "listen": какой IPv6-адрес и порт слушать.
-# "::" -- все интерфейсы, "::1" -- только локальный.
-LISTEN_HOST = "::1"
-LISTEN_PORT = 15550
+# Порт, на котором борт отдаёт MAVLink (UdpEndpoint в main.conf).
+DRONE_PORT = 14550
 
-# Для MODE = "connect": куда подключаться.
-# Можно имя хоста или IPv6-адрес. Квадратные скобки не нужны.
-SOURCE_HOST = "raspberrypi.lan"
-SOURCE_PORT = 14550
+# Локальный порт для Mission Planner. Его же вписываешь в MP.
+LOCAL_PORT = 14551
 
-# Куда отдаём поток по IPv4. Этот порт и указываешь в Mission Planner
-# (режим UDP, слушающий).
-DEST_HOST = "127.0.0.1"
-DEST_PORT = 15551
+# False -- борт ждёт подключения (Mode=Server в main.conf), мы идём к нему. Обычный случай.
+# True  -- борт сам шлёт на нас (Mode=Normal), мы только слушаем.
+WAIT_FOR_DRONE = False
 
 # Печатать статистику раз в N секунд. 0 -- не печатать.
 STATS_EVERY = 5
@@ -43,54 +39,72 @@ import sys
 import time
 
 
-def main():
-    # куда отдаём -- всегда IPv4
+def resolve_v6(host, port):
+    """Получить IPv6-адрес. Литерал разбираем напрямую, имя -- через DNS."""
     try:
-        dest = socket.getaddrinfo(DEST_HOST, DEST_PORT,
-                                  socket.AF_INET, socket.SOCK_DGRAM)[0][4]
+        return socket.getaddrinfo(host, port, socket.AF_INET6, socket.SOCK_DGRAM,
+                                  0, socket.AI_NUMERICHOST)[0][4]
+    except socket.gaierror:
+        pass  # не литерал -- пробуем как имя
+    try:
+        return socket.getaddrinfo(host, port, socket.AF_INET6, socket.SOCK_DGRAM)[0][4]
     except socket.gaierror as e:
-        sys.exit("DEST_HOST: не удалось разрешить %s (%s)" % (DEST_HOST, e))
+        sys.exit("DRONE_IP: %s -- не IPv6-адрес и не имя с AAAA-записью (%s)" % (host, e))
+
+
+def hint_no_data():
+    print("\nПакетов с борта нет. Что проверить:", file=sys.stderr)
+    print("  1. ZeroTier поднят и борт в сети:   zerotier-cli listnetworks",
+          file=sys.stderr)
+    print("  2. Борт пингуется:                  ping -6 %s" % DRONE_IP, file=sys.stderr)
+    print("  3. Роутер на борту слушает IPv6. В /etc/mavlink-router/main.conf должно",
+          file=sys.stderr)
+    print("     быть  Address=[::]  , а не 0.0.0.0 -- иначе порт доступен только по IPv4.",
+          file=sys.stderr)
+    print("  4. Порт совпадает:                  DRONE_PORT = %d" % DRONE_PORT,
+          file=sys.stderr)
+    print("  5. Брандмауэр не режет исходящий UDP на этот порт.\n", file=sys.stderr)
+
+
+def main():
+    dest = ("127.0.0.1", LOCAL_PORT)
 
     up = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
-    # принимать и IPv4-mapped адреса, чтобы релей работал в смешанной сети
-    try:
-        up.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
-    except OSError:
-        pass
-
     peer = None
 
-    if MODE == "listen":
+    if WAIT_FOR_DRONE:
         try:
-            up.bind((LISTEN_HOST, LISTEN_PORT))
+            up.bind(("::", DRONE_PORT))
         except OSError as e:
-            sys.exit("не удалось занять [%s]:%d (%s)" % (LISTEN_HOST, LISTEN_PORT, e))
-        source = "[%s]:%d" % (LISTEN_HOST, LISTEN_PORT)
-
-    elif MODE == "connect":
-        try:
-            peer = socket.getaddrinfo(SOURCE_HOST, SOURCE_PORT,
-                                      socket.AF_INET6, socket.SOCK_DGRAM)[0][4]
-        except socket.gaierror as e:
-            sys.exit("SOURCE_HOST: у %s нет IPv6-адреса (%s)" % (SOURCE_HOST, e))
-        up.sendto(b"", peer)  # разбудить источник, чтобы он узнал наш адрес
-        source = "%s:%d" % (SOURCE_HOST, SOURCE_PORT)
-
+            sys.exit("не удалось занять порт %d: %s" % (DRONE_PORT, e))
+        print("жду поток от борта на [::]:%d" % DRONE_PORT, flush=True)
     else:
-        sys.exit('MODE должен быть "listen" или "connect", а не %r' % MODE)
+        peer = resolve_v6(DRONE_IP, DRONE_PORT)
+        print("подключаюсь к борту [%s]:%d" % (DRONE_IP, DRONE_PORT), flush=True)
 
     down = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    down.bind(("0.0.0.0", 0))
+    down.bind(("127.0.0.1", 0))
 
-    print("релей: IPv6 %s  ->  IPv4 %s:%d" % (source, DEST_HOST, DEST_PORT), flush=True)
-    if peer is None:
-        print("жду первый пакет от источника...", flush=True)
+    print("отдаю на 127.0.0.1:%d  -- это и указывай в Mission Planner (режим UDP)"
+          % LOCAL_PORT, flush=True)
 
     to_v4 = to_v6 = 0
-    last = time.time()
+    started = time.time()
+    last_stats = started
+    last_poke = 0.0
+    warned = False
 
     try:
         while True:
+            # пока борт не отозвался, периодически будим его пустым пакетом:
+            # в режиме Server он молчит, пока не узнает адрес клиента
+            if peer is not None and to_v4 == 0 and time.time() - last_poke >= 1.0:
+                try:
+                    up.sendto(b"", peer)
+                except OSError as e:
+                    sys.exit("не могу отправить на [%s]:%d -- %s" % (DRONE_IP, DRONE_PORT, e))
+                last_poke = time.time()
+
             ready, _, _ = select.select([up, down], [], [], 1.0)
 
             for sock in ready:
@@ -104,20 +118,27 @@ def main():
                 if sock is up:
                     if peer is None:
                         peer = addr
-                        print("источник найден: %s" % (addr[0],), flush=True)
+                        print("борт найден: %s" % (addr[0],), flush=True)
+                    if to_v4 == 0:
+                        print("поток пошёл", flush=True)
                     down.sendto(data, dest)
                     to_v4 += 1
                 elif peer is not None:
-                    # обратный ход: команды и запросы от приёмника к источнику
                     up.sendto(data, peer)
                     to_v6 += 1
 
-            if STATS_EVERY and time.time() - last >= STATS_EVERY:
-                print("  IPv6->IPv4: %d   IPv4->IPv6: %d" % (to_v4, to_v6), flush=True)
-                last = time.time()
+            now = time.time()
+
+            if not warned and to_v4 == 0 and now - started >= 10:
+                hint_no_data()
+                warned = True
+
+            if STATS_EVERY and now - last_stats >= STATS_EVERY:
+                print("  борт->MP: %d   MP->борт: %d" % (to_v4, to_v6), flush=True)
+                last_stats = now
 
     except KeyboardInterrupt:
-        print("\nостановлено. IPv6->IPv4: %d, IPv4->IPv6: %d" % (to_v4, to_v6))
+        print("\nостановлено. борт->MP: %d, MP->борт: %d" % (to_v4, to_v6))
     finally:
         up.close()
         down.close()
